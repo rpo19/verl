@@ -109,6 +109,7 @@ class HFRollout(BaseRollout):
             # recurse need to set to False according to https://github.com/pytorch/pytorch/issues/100069
             param_ctx = FSDP.summon_full_params(self.module, writeback=False, recurse=False)
         with param_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+            # TODO add here refactx logit processor
             output = self.module.generate(
                 input_ids=idx,
                 attention_mask=attention_mask,
