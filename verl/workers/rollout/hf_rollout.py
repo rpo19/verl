@@ -124,6 +124,9 @@ class HFRollout(BaseRollout):
                 use_cache=True,
             )
 
+        # TODO refactx remove gradients for fact-tokens generated from the prefix tree
+        # use generated_triples and find them in the input
+
         # TODO: filter out the seq with no answers like ds-chat
         seq = output.sequences
         generated_batch_size = seq.size(0)  # bs * num_return_sequences
