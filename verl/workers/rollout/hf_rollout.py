@@ -19,13 +19,15 @@ to perform generation.
 """
 
 import contextlib
+import os
 
+import refactx
 import torch
 import torch.distributed
 from tensordict import TensorDict
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from transformers import GenerationConfig
+from transformers import AutoTokenizer, GenerationConfig
 
 from verl import DataProto
 from verl.utils.device import get_device_name, get_torch_device
@@ -41,6 +43,12 @@ class HFRollout(BaseRollout):
         super().__init__()
         self.config = config
         self.module = module
+
+        tokenizer = AutoTokenizer.from_pretrained(os.environt['REFACTX_MODEL_NAME'], use_fast=True)
+        index = refactx.load_index(os.environ['REFACTX_INDEX_PATH'])
+        num_beams = self.config.get("num_beams", 1)
+        num_batches = self.config.get("micro_batch_size", 1)
+        self.constrained_processor = refactx.get_constrained_logits_processor(tokenizer, index, num_beams, num_batches)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
@@ -122,6 +130,7 @@ class HFRollout(BaseRollout):
                 output_scores=False,  # this is potentially very large
                 return_dict_in_generate=True,
                 use_cache=True,
+                logits_processor=self.constrained_processor, # mod for REFACTX
             )
 
         # TODO refactx remove gradients for fact-tokens generated from the prefix tree
@@ -163,16 +172,59 @@ class HFRollout(BaseRollout):
         )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
-        batch = TensorDict(
-            {
-                "prompts": prompt,
-                "responses": response,
-                "input_ids": seq,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=generated_batch_size,
-        )
+        if os.environ.get("REFACTX_ENABLE_FACT_TOKEN_MASK", "1") == "1":
+            # save fact_token_mask in the batch
+            constrained_states = refactx.get_constrained_states()
+            # fact_token_mask :  batch_size x seq_length
+            fact_token_mask = torch.zeros_like(seq, dtype=torch.bool)
+            # for each batch
+            for i in range(generated_batch_size):
+                # for each beam
+                # for j in range(num_return_sequences): # should be first
+                    state = constrained_states[i, 0]
+
+                    # find the triples generated from the prefix tree in the response
+                    response_ids = response[i]
+                    
+                    for triple_ids in state.generated_triples:
+                        # find the triple_ids in response_ids
+                        triple_length = len(triple_ids)
+                        for start_idx in range(response_length - triple_length + 1):
+                            if torch.equal(response_ids[start_idx:start_idx + triple_length], torch.tensor(triple_ids, device=response_ids.device)):
+                                # mark the positions as fact tokens
+                                fact_token_mask[i, prompt_length + start_idx: prompt_length + start_idx + triple_length] = True
+
+
+
+            def default_compute_response_mask(responses, attention_mask):
+                # from ppo ray trainer # mask prompt tokens
+                response_length = responses.size(1)
+                return attention_mask[:, -response_length:]
+
+            response_mask = default_compute_response_mask(response, attention_mask)
+            batch = TensorDict(
+                {
+                    "prompts": prompt,
+                    "responses": response,
+                    "input_ids": seq,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    # "fact_token_mask": fact_token_mask,
+                    "response_mask": response_mask & ~fact_token_mask # mask out fact tokens
+                },
+                batch_size=generated_batch_size,
+            )
+        else:
+            batch = TensorDict(
+                {
+                    "prompts": prompt,
+                    "responses": response,
+                    "input_ids": seq,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                },
+                batch_size=generated_batch_size,
+            )
 
         # empty cache before compute old_log_prob
         get_torch_device().empty_cache()
